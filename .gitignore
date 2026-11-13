@@ -1,0 +1,12 @@
+﻿# 本地配置与日志
+config/
+*.log
+
+# 临时文件
+_dsh_probe.txt
+fetch-*.json
+~$*
+
+# 系统文件
+Thumbs.db
+Desktop.ini
