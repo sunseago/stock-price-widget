@@ -49,7 +49,7 @@
 ### 新增
 
 - `tests\Test-Widget.ps1`：不依赖 Pester 的自检脚本，24 项断言（交易所推断、市场识别、de-DE 区域下的格式化、假期表跨年）+ 5 张离屏渲染 PNG。
-- `PDD-Widget.ps1` 支持 `-NoRun`（只加载不启动窗口），供测试 dot-source；文件路径与配置目录在 README 中更正为 `src\` 与 `%LOCALAPPDATA%`。
+- `PDD-Widget.ps1` 支持 `-NoRun`（只加载不启动窗口），供测试 dot-source；`dist\`/`config` 目录位置在 README 中更正为 `src\` 与 `%LOCALAPPDATA%`。
 - `.gitignore` 增加 `dist/*.exe`、`*.tmp`。
 
 ### 未修（已知限制）
