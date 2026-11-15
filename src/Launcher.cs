@@ -51,7 +51,11 @@ internal static class Launcher
             if (wantShortcut) { TryCreateDesktopShortcut(); }
 
             string ps = Path.Combine(dir, "PDD-Widget.ps1");
-            ProcessStartInfo psi = new ProcessStartInfo("powershell.exe");
+            // 用绝对路径调用 Windows PowerShell: 不依赖 PATH (部分机器/安全软件会改写 PATH, 裸名字启动会失败且只在临时日志里留痕)
+            string psExe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                                        @"WindowsPowerShell\v1.0\powershell.exe");
+            if (!File.Exists(psExe)) { psExe = "powershell.exe"; }
+            ProcessStartInfo psi = new ProcessStartInfo(psExe);
             psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Sta -WindowStyle Hidden -File \"" + ps + "\"";
             psi.CreateNoWindow = true;
             psi.UseShellExecute = false;
