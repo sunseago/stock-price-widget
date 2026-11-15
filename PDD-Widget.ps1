@@ -19,17 +19,45 @@
 #    -Demo : built-in demo quote (offline, for UI preview)
 # =====================================================================
 
-param([switch]$Demo)
+param([switch]$Demo, [switch]$NoRun)
 
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# ---- DPI --------------------------------------------------------------
+# EXE 由 csc 生成, 没有 dpiAware 清单, 进程默认是 DPI 非感知: 125%/150% 缩放下
+# 整块卡片被位图拉伸, 文字发虚。这里在创建任何窗口前声明 System DPI 感知,
+# 再按实际 DPI 缩放几何尺寸(字号用磅, 本身随 DPI 放大, 比例自然一致)。
+$script:Scale = 1.0
+function Enable-DpiAwareness {
+    $ok = $false
+    try {
+        if (-not ('DpiUtil' -as [type])) {
+            $sig = 'using System;using System.Runtime.InteropServices;' +
+                   'public static class DpiUtil{' +
+                   '[DllImport("user32.dll")]public static extern bool SetProcessDpiAwarenessContext(IntPtr v);' +
+                   '[DllImport("user32.dll")]public static extern uint GetDpiForSystem();' +
+                   '[DllImport("user32.dll")]public static extern bool SetProcessDPIAware();}'
+            Add-Type -TypeDefinition $sig -ErrorAction Stop | Out-Null
+        }
+    } catch {}
+    try { $ok = [DpiUtil]::SetProcessDpiAwarenessContext([IntPtr](-2)) } catch {}   # -2 = SYSTEM_AWARE
+    if (-not $ok) { try { $ok = [DpiUtil]::SetProcessDPIAware() } catch {} }
+    # 没能接管 DPI 感知时保持 Scale=1: 让系统继续按位图拉伸, 避免"系统缩放 + 自己缩放"叠加
+    if (-not $ok) { $script:Scale = 1.0; return }
+    $dpi = 96
+    try { $dpi = [int][DpiUtil]::GetDpiForSystem() } catch {}
+    if ($dpi -le 0) { $dpi = 96 }
+    $script:Scale = [math]::Round($dpi / 96.0, 3)
+}
+Enable-DpiAwareness
+
 # ---- constants -------------------------------------------------------
 $script:Ticker    = 'PDD'
 $script:StockName   = '拼多多'
 $script:FetchScript = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) 'PDD-Fetch.ps1'
-$script:FetchTimeoutMs = 30000
+$script:FetchTimeoutMs = 15000   # 常驻子进程下单轮最坏 ~12s(3 源 x 4s)
 $script:DefaultSources = @('tencent', 'eastmoney', 'sina')
 
 function Get-MarketKind([string]$code) {
@@ -39,13 +67,21 @@ function Get-MarketKind([string]$code) {
     if ($c -match '^[0-9]{4,5}$') { return 'HK' }
     return 'US'
 }
+function Get-AShareExchange([string]$num) {
+    # 与取数脚本同一套规则: 6=沪A, 900=沪B, 92=北交所新代码段, 43/83/87/88=北交所, 其余=深市
+    if ($num -match '^6') { return 'sh' }
+    if ($num -match '^92') { return 'bj' }
+    if ($num -match '^9') { return 'sh' }
+    if ($num -match '^(43|83|87|88)') { return 'bj' }
+    return 'sz'
+}
 function Get-QuotePageUrl {
     $raw = ([string]$script:Cfg.Ticker).Trim().ToUpperInvariant()
     if (-not $raw) { $raw = 'PDD' }
     $kind = Get-MarketKind $raw
     $c = $raw -replace '^(SH|SZ|BJ|HK|US)', ''
     if ($kind -eq 'ASH') {
-        $ex = if ($c[0] -eq '6' -or $c[0] -eq '9') { 'sh' } elseif ($c[0] -eq '4' -or $c[0] -eq '8') { 'bj' } else { 'sz' }
+        $ex = Get-AShareExchange $c
         return "https://quote.eastmoney.com/$ex$c.html"
     }
     if ($kind -eq 'HK') { return "https://quote.eastmoney.com/hk/$c.html" }
@@ -83,8 +119,8 @@ function Set-Stock([string]$code, [string]$name) {
     $script:FetchErr = ''
     Save-Cfg
     if ($script:TmrRefresh) { $script:TmrRefresh.Interval = (Get-EffectiveRefreshSec) * 1000 }
+    $script:PaintRev++
     if ($script:DemoOn) { $script:Quote = Get-DemoQuote } else { Start-Fetch }
-    if ($script:Form) { $script:Form.Invalidate() }
     Show-Toast ('已切换: ' + $code + ' ' + $name)
 }
 function Get-AutostartPath { return (Join-Path ([Environment]::GetFolderPath('Startup')) '股价悬浮窗.lnk') }
@@ -134,6 +170,7 @@ $script:Cfg = @{
     Ticker     = 'PDD'
     StockName  = '拼多多'
     Sources    = $script:DefaultSources
+    SrcMigrated = $false      # 数据源顺序迁移只做一次, 之后尊重用户配置
 }
 $script:Quote = $null
 $script:SourceUsed = ''
@@ -142,6 +179,12 @@ $script:Fetching = $false
 $script:FetchProc = $null
 $script:FetchTmp = ''
 $script:FetchStart = [datetime]::MinValue
+$script:FetchHost = $null        # 常驻取数子进程
+$script:FetchHostIn = $null      # 其 stdin 写入器
+$script:QuoteAt = [datetime]::MinValue
+$script:PaintRev = 0             # 内容版本号: 只有变了才重画
+$script:SeenRev = -1
+$script:FadeRun = $false
 $script:DemoOn = [bool]$Demo
 $script:IsDragging = $false
 $script:DragOffset = $null
@@ -317,6 +360,15 @@ function Test-MarketHoliday([string]$kind, [datetime]$d) {
         return ($tbl[$kind] -contains $d.ToString('yyyy-MM-dd'))
     } catch { return $false }
 }
+function Test-HolidayTableFresh([string]$kind, [int]$year) {
+    # 表里若没有今年任何一条, 说明跨年了: 不能把"查不到"当成"不是假期"
+    try {
+        $tbl = Get-MarketHolidayTable
+        if (-not $tbl.ContainsKey($kind)) { return $false }
+        foreach ($d in @($tbl[$kind])) { if ([string]$d -like "$year-*") { return $true } }
+    } catch {}
+    return $false
+}
 function Get-NextMarketHoliday([string]$kind) {
     try {
         $tbl = Get-MarketHolidayTable
@@ -331,7 +383,7 @@ function Get-TradingSession([string]$kind) {
     # 结果缓存 20 秒: 绘制时每帧要调用两次, 原先每次都重建假日表
     $now = Get-Date
     if ($script:SesCache -and $script:SesKind -eq $kind -and ($now - $script:SesCacheAt).TotalSeconds -lt 20) { return $script:SesCache }
-    $labelMap = @{ PRE = '盘前'; REGULAR = '交易中'; AFTER = '盘后'; CLOSED = '休市' }
+    $labelMap = @{ PRE = '盘前'; REGULAR = '交易中'; BREAK = '午间休市'; AFTER = '盘后'; CLOSED = '休市' }
     $mktLabel = @{ US = '美股'; ASH = 'A股'; HK = '港股' }[$kind]
     if ($kind -eq 'US') {
         $tz = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
@@ -340,7 +392,11 @@ function Get-TradingSession([string]$kind) {
         # A股/港股均为 UTC+8 且无夏令时
         $lt = [DateTime]::UtcNow.AddHours(8)
     }
-    $res = @{ Key = 'CLOSED'; Label = '休市'; Local = $lt; Mkt = $mktLabel; Minutes = ($lt.Hour * 60 + $lt.Minute) }
+    $res = @{ Key = 'CLOSED'; Label = '休市'; Local = $lt; Mkt = $mktLabel; Minutes = ($lt.Hour * 60 + $lt.Minute); Note = '' }
+    # 内置假期表只覆盖到 2026: 跨年后不能把"查不到"当成"不是假期", 而是标注未覆盖
+    if ($kind -ne 'US' -and -not (Test-HolidayTableFresh $kind $lt.Year)) {
+        $res.Note = '假期表未覆盖 ' + $lt.Year + ', 仅按时间判断'
+    }
     $weekend = ($lt.DayOfWeek -eq [DayOfWeek]::Saturday -or $lt.DayOfWeek -eq [DayOfWeek]::Sunday)
     if ($weekend -or (Test-MarketHoliday $kind $lt)) {
         $script:SesCache = $res; $script:SesKind = $kind; $script:SesCacheAt = $now
@@ -351,11 +407,15 @@ function Get-TradingSession([string]$kind) {
         elseif ($res.Minutes -ge 570 -and $res.Minutes -lt 960)  { $res.Key = 'REGULAR' }
         elseif ($res.Minutes -ge 960 -and $res.Minutes -lt 1200) { $res.Key = 'AFTER' }
     } elseif ($kind -eq 'ASH') {
-        # 9:30-11:30 / 13:00-15:00 (北京时间, 已含 2026 法定节假日)
-        if (($res.Minutes -ge 570 -and $res.Minutes -lt 690) -or ($res.Minutes -ge 780 -and $res.Minutes -lt 900)) { $res.Key = 'REGULAR' }
+        # 9:15-9:25 集合竞价 / 9:30-11:30 / 午休 / 13:00-15:00 (北京时间, 含 2026 法定节假日)
+        if ($res.Minutes -ge 555 -and $res.Minutes -lt 570) { $res.Key = 'PRE' }
+        elseif (($res.Minutes -ge 570 -and $res.Minutes -lt 690) -or ($res.Minutes -ge 780 -and $res.Minutes -lt 900)) { $res.Key = 'REGULAR' }
+        elseif ($res.Minutes -ge 690 -and $res.Minutes -lt 780) { $res.Key = 'BREAK' }
     } else {
-        # 港股 9:30-12:00 / 13:00-16:00
-        if (($res.Minutes -ge 570 -and $res.Minutes -lt 720) -or ($res.Minutes -ge 780 -and $res.Minutes -lt 960)) { $res.Key = 'REGULAR' }
+        # 港股 9:00-9:30 竞价 / 9:30-12:00 / 午休 / 13:00-16:00
+        if ($res.Minutes -ge 540 -and $res.Minutes -lt 570) { $res.Key = 'PRE' }
+        elseif (($res.Minutes -ge 570 -and $res.Minutes -lt 720) -or ($res.Minutes -ge 780 -and $res.Minutes -lt 960)) { $res.Key = 'REGULAR' }
+        elseif ($res.Minutes -ge 720 -and $res.Minutes -lt 780) { $res.Key = 'BREAK' }
     }
     $res.Label = $labelMap[$res.Key]
     $script:SesCache = $res; $script:SesKind = $kind; $script:SesCacheAt = $now
@@ -378,20 +438,71 @@ function Get-EffectiveRefreshSec {
 }
 
 # ---- formatting ------------------------------------------------------
+# 一律按不变文化格式化: 否则德/法区域会把小数点变成逗号, 显示成 "1435,26"
+$script:InvCI = [System.Globalization.CultureInfo]::InvariantCulture
 function Format-Vol([double]$v) {
-    if ($v -ge 1e8) { return ('{0:N2}亿' -f ($v / 1e8)) }
-    if ($v -ge 1e4) { return ('{0:N2}万' -f ($v / 1e4)) }
-    return ('{0:N0}' -f $v)
+    if ($v -ge 1e8) { return [string]::Format($script:InvCI, '{0:N2}亿', ($v / 1e8)) }
+    if ($v -ge 1e4) { return [string]::Format($script:InvCI, '{0:N2}万', ($v / 1e4)) }
+    return [string]::Format($script:InvCI, '{0:N0}', $v)
 }
 function Format-Amt([double]$v, [string]$cur) {
     $unit = @{ USD = '美元'; CNY = '元'; HKD = '港元' }[$cur]
     if (-not $unit) { $unit = '美元' }
-    if ($v -ge 1e8) { return ('{0:N2}亿{1}' -f ($v / 1e8), $unit) }
-    if ($v -ge 1e4) { return ('{0:N1}万{1}' -f ($v / 1e4), $unit) }
-    return ('{0:N0}{1}' -f $v, $unit)
+    if ($v -ge 1e8) { return ([string]::Format($script:InvCI, '{0:N2}亿', ($v / 1e8)) + $unit) }
+    if ($v -ge 1e4) { return ([string]::Format($script:InvCI, '{0:N1}万', ($v / 1e4)) + $unit) }
+    return ([string]::Format($script:InvCI, '{0:N0}', $v) + $unit)
+}
+function Format-Price([double]$v) { return [string]::Format($script:InvCI, '{0:N2}', $v) }
+# 明细行空间紧, 不带千分位, 四个价位才放得下
+function Format-PricePlain([double]$v) { return [string]::Format($script:InvCI, '{0:0.00}', $v) }
+
+# ---- async fetch (resident child process) ----------------------------
+# 原先每轮刷新都 Start-Process 一个新 powershell: 实测单次 0.9~1.3s, 其中 PS5.1
+# 冷启动就占 0.4s, 6s 刷新 = 每天 1.4 万次进程创建。改为常驻子进程 + stdin 命令,
+# 单轮只剩网络时间; 起不来时才退回一次性进程。
+function Get-PowerShellExe {
+    $p = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $p) { return $p }
+    return 'powershell.exe'
 }
 
-# ---- async fetch (child process) -------------------------------------
+function Stop-FetchHost {
+    try {
+        if ($script:FetchHostIn) { $script:FetchHostIn.WriteLine('QUIT'); $script:FetchHostIn.Flush() }
+    } catch {}
+    try { if ($script:FetchHostIn) { $script:FetchHostIn.Dispose() } } catch {}
+    $script:FetchHostIn = $null
+    try {
+        if ($script:FetchHost -and -not $script:FetchHost.HasExited) {
+            if (-not $script:FetchHost.WaitForExit(2000)) { $script:FetchHost.Kill() }
+        }
+    } catch {}
+    try { if ($script:FetchHost) { $script:FetchHost.Dispose() } } catch {}
+    $script:FetchHost = $null
+}
+
+function Start-FetchHost {
+    if ($script:FetchHost -and $script:FetchHostIn -and -not $script:FetchHost.HasExited) { return $true }
+    Stop-FetchHost
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = Get-PowerShellExe
+        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script:FetchScript + '" -Serve'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $psi.RedirectStandardInput = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        if (-not $proc) { return $false }
+        $script:FetchHost = $proc
+        $script:FetchHostIn = $proc.StandardInput
+        return $true
+    } catch {
+        Trace-Msg ('fetch-host err: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
 function Start-Fetch {
     if ($script:DemoOn -or $script:Fetching) { return }
     if ($script:FetchProc -and $script:FetchProc.HasExited) {
@@ -399,64 +510,92 @@ function Start-Fetch {
         $script:FetchProc = $null
     }
     if ($script:FetchProc) { return }
+    if ($script:FetchTmp -and (Test-Path -LiteralPath $script:FetchTmp)) {
+        Remove-Item -LiteralPath $script:FetchTmp -Force -ErrorAction SilentlyContinue
+    }
     $script:FetchTmp = Join-Path $script:ConfigDir ('fetch-' + [guid]::NewGuid().ToString('N') + '.json')
     # 白名单校验: 防止被手工改坏的 config.json 把参数注入到子进程
     $tk = ([string]$script:Ticker).Trim()
     if ($tk -notmatch '^[A-Za-z0-9.\-]{1,12}$') { $tk = 'PDD' }
     $srcs = @($script:Cfg.Sources | Where-Object { $_ -in @('tencent', 'eastmoney', 'sina') })
     if ($srcs.Count -eq 0) { $srcs = @('tencent') }
+    # 上次成功的源排到最前: 掉线的源不会每轮都先吃一次超时
+    if ($script:LastGoodSrc -and ($srcs -contains $script:LastGoodSrc)) {
+        $srcs = @($script:LastGoodSrc) + @($srcs | Where-Object { $_ -ne $script:LastGoodSrc })
+    }
     $sources = ($srcs -join ',')
+
+    $script:FetchStart = Get-Date
+    $script:Fetching = $true
+    if ($script:TmrPoll) { $script:TmrPoll.Start() }
+
+    if (Start-FetchHost) {
+        try {
+            $script:FetchHostIn.WriteLine($tk + '|' + $sources + '|' + $script:FetchTmp)
+            $script:FetchHostIn.Flush()
+            return
+        } catch {
+            Trace-Msg ('fetch-host write err: ' + $_.Exception.Message)
+            Stop-FetchHost
+        }
+    }
+
+    # 兜底: 常驻进程起不来时退回一次性进程
     $fs = $script:FetchScript
-    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta',
-              '-File', ('"' + $fs + '"'),
-              '-Ticker', $tk,
-              '-Sources', $sources,
-              '-Out', ('"' + $script:FetchTmp + '"'))
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $fs + '"'),
+            '-Ticker', $tk, '-Sources', $sources, '-Out', ('"' + $script:FetchTmp + '"'))
     try {
-        $script:FetchProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden -PassThru
-        $script:Fetching = $true
-        $script:FetchStart = Get-Date
-        if ($script:TmrPoll) { $script:TmrPoll.Start() }
+        $script:FetchProc = Start-Process -FilePath (Get-PowerShellExe) -ArgumentList $a -WindowStyle Hidden -PassThru
     } catch {
         $script:FetchErr = '启动取数失败: ' + $_.Exception.Message
         $script:FetchProc = $null
+        $script:Fetching = $false
+        if ($script:TmrPoll) { try { $script:TmrPoll.Stop() } catch {} }
     }
 }
 
-function Complete-Fetch {
-    $script:Fetching = $false
-    try { if ($script:TmrPoll) { $script:TmrPoll.Stop() } } catch {}
+function Try-Complete-Fetch {
+    # 只有拿到完整 JSON 才算结束本轮: 子进程还在写就留给下一轮轮询,
+    # 顺带把"读到半截文件 -> 解析失败"这条误报消掉
+    if (-not $script:FetchTmp) { return $false }
+    if (-not (Test-Path -LiteralPath $script:FetchTmp)) { return $false }
+    $txt = ''
     try {
-        if (Test-Path $script:FetchTmp) {
-            $txt = Get-Content $script:FetchTmp -Raw -Encoding UTF8
-            Remove-Item $script:FetchTmp -Force -ErrorAction SilentlyContinue
-            $j = $txt | ConvertFrom-Json
-            if ($j -and $j.ok) {
-                $d = $j.q
-                $q = [pscustomobject]@{
-                    Name = [string]$d.Name; Code = [string]$d.Code
-                    Price = [double]$d.Price; PrevClose = [double]$d.PrevClose
-                    Open = [double]$d.Open; High = [double]$d.High; Low = [double]$d.Low
-                    Volume = [double]$d.Volume; Amount = [double]$d.Amount
-                    QuoteTime = [string]$d.QuoteTime
-                    Chg = [double]$d.Chg; Pct = [double]$d.Pct; Up = [int]$d.Up; Stale = $false
-                    Currency = [string]$d.Currency; Market = [string]$d.Market
-                }
-                $script:Quote = $q
-                $sn = [string]$j.src
-                $script:SourceUsed = switch ($sn) { 'eastmoney' { '东财' } 'tencent' { '腾讯' } 'sina' { '新浪' } default { $sn } }
-                $script:FetchErr = ''
-                Save-LastQuote $q
-            } else {
-                $script:FetchErr = if ($j -and $j.err) { [string]$j.err } else { '无数据' }
+        $txt = [System.IO.File]::ReadAllText($script:FetchTmp, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { return $false }
+    if (-not $txt -or -not $txt.Trim()) { return $false }
+    $j = $null
+    try { $j = $txt | ConvertFrom-Json } catch { return $false }
+    if ($null -eq $j) { return $false }
+    Remove-Item -LiteralPath $script:FetchTmp -Force -ErrorAction SilentlyContinue
+    try {
+        if ($j.ok) {
+            $d = $j.q
+            $q = [pscustomobject]@{
+                Name = [string]$d.Name; Code = [string]$d.Code
+                Price = [double]$d.Price; PrevClose = [double]$d.PrevClose
+                Open = [double]$d.Open; High = [double]$d.High; Low = [double]$d.Low
+                Volume = [double]$d.Volume; Amount = [double]$d.Amount
+                QuoteTime = [string]$d.QuoteTime
+                Chg = [double]$d.Chg; Pct = [double]$d.Pct; Up = [int]$d.Up; Stale = $false
+                Currency = [string]$d.Currency; Market = [string]$d.Market
+                Warn = [string]$d.Warn
             }
+            $script:Quote = $q
+            $script:QuoteAt = Get-Date
+            $script:LastGoodSrc = [string]$j.src
+            $sn = [string]$j.src
+            $script:SourceUsed = switch ($sn) { 'eastmoney' { '东财' } 'tencent' { '腾讯' } 'sina' { '新浪' } default { $sn } }
+            $script:FetchErr = ''
+            Save-LastQuote $q
         } else {
-            $script:FetchErr = '取数超时'
+            $script:FetchErr = if ($j.err) { [string]$j.err } else { '无数据' }
         }
     } catch {
         $script:FetchErr = '解析失败: ' + $_.Exception.Message
     }
-    if ($script:Form) { $script:Form.Invalidate() }
+    $script:PaintRev++
+    return $true
 }
 
 # ---- drawing helpers -------------------------------------------------
@@ -490,17 +629,36 @@ function Get-DirBrush([int]$up) {
     if ($up -lt 0) { return $script:BrDown }
     return $script:BrFlat
 }
+function Initialize-Assets {
+    # 字体用磅值(随 DPI 自动放大), 几何尺寸按 $script:Scale 缩放, 两者比例一致。
+    # 单独成函数是为了让 tests\Render-Smoke 能离屏复用同一套资源。
+    $script:FPrice = New-Object System.Drawing.Font('Segoe UI', 25, [System.Drawing.FontStyle]::Bold)
+    $script:FPct   = New-Object System.Drawing.Font('Segoe UI', 12.5, [System.Drawing.FontStyle]::Bold)
+    $script:FName  = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
+    $script:FMeta  = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $script:FTiny  = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+    $script:BrText   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 234, 238, 244))
+    $script:BrDim    = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 146, 154, 164))
+    $script:BrBadge  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 47, 174, 133))
+    $script:BrBadgeG = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 118, 128, 140))
+    $script:BrUp     = New-Object System.Drawing.SolidBrush($script:ColorUp)
+    $script:BrDown   = New-Object System.Drawing.SolidBrush($script:ColorDown)
+    $script:BrFlat   = New-Object System.Drawing.SolidBrush($script:ColorFlat)
+    $script:BrWarn   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 232, 172, 74))
+    $script:PenCard  = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 255, 255, 255), 1)
+}
+
 function Show-Toast([string]$msg, [int]$ms = 1600) {
     $script:ToastText = $msg
     $script:ToastUntil = (Get-Date).AddMilliseconds($ms)
-    if ($script:Form) { $script:Form.Invalidate() }
+    $script:PaintRev++   # 由悬停定时器负责重画, 避免每一处都直接 Invalidate
 }
 
 # ---- paint -----------------------------------------------------------
-function Draw-Card($g) {
-    $form = $script:Form
-    if (-not $form) { return }
-    $w = $form.ClientSize.Width; $h = $form.ClientSize.Height
+function Draw-Card($g, [int]$w, [int]$h) {
+    # w/h 由调用方传入(便于离屏渲染自检), 不再依赖全局 $Form
+    if ($w -le 0 -or $h -le 0) { return }
+    $s = $script:Scale
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
 
@@ -510,7 +668,7 @@ function Draw-Card($g) {
             [System.Drawing.Color]::FromArgb(255, 26, 29, 37),
             [System.Drawing.Color]::FromArgb(255, 12, 14, 19), 90.0)
         $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $r = 16
+        $r = [int](16 * $s)
         $path.AddArc(1, 1, ($r * 2), ($r * 2), 180, 90)
         $path.AddArc(($w - 1 - $r * 2), 1, ($r * 2), ($r * 2), 270, 90)
         $path.AddArc(($w - 1 - $r * 2), ($h - 1 - $r * 2), ($r * 2), ($r * 2), 0, 90)
@@ -521,26 +679,34 @@ function Draw-Card($g) {
         $path.Dispose(); $grad.Dispose()
     }
 
-    $x0 = 16
+    $x0 = [int](16 * $s)
     $q = $script:Quote
     $dirBrush = $script:BrFlat
     if ($q) { $dirBrush = Get-DirBrush $q.Up }
 
+    # badge 几何先算: 标题以它为右边界, 长名字用省略号截断, 不会压到徽章上
+    $bw = [int](66 * $s); $bh = [int](20 * $s); $bx = $w - [int](16 * $s) - $bw; $by = [int](9 * $s)
+
     # header
     $name = "$($script:Ticker)  $($script:StockName)"
     if ($q -and $q.Name) { $name = "$($q.Code)  $($q.Name)" }
-    $g.DrawString($name, $script:FName, $script:BrText, $x0, 12)
+    $sfH = New-Object System.Drawing.StringFormat
+    $sfH.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+    $sfH.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+    $g.DrawString($name, $script:FName, $script:BrText,
+        (New-Object System.Drawing.RectangleF($x0, [int](10 * $s), [float]($bx - $x0 - [int](6 * $s)), [float](22 * $s))), $sfH)
+    $sfH.Dispose()
 
     $st = Get-TradingSession (Get-MarketKind $script:Ticker)
     $badge = if ($script:DemoOn) { '演示' } else { $st.Label }
     $badgeCol = $script:BrBadge
     if ($st.Key -eq 'PRE' -or $st.Key -eq 'AFTER') {
         $badgeCol = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 226, 160, 58))
-    } elseif ($st.Key -eq 'CLOSED') { $badgeCol = $script:BrBadgeG }
-    $bw = 66; $bh = 20; $bx = $w - 16 - $bw; $by = 9
+    } elseif ($st.Key -eq 'CLOSED' -or $st.Key -eq 'BREAK') { $badgeCol = $script:BrBadgeG }
     $bpath = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $bpath.AddArc($bx, $by, 10, 10, 180, 90); $bpath.AddArc(($bx + $bw - 10), $by, 10, 10, 270, 90)
-    $bpath.AddArc(($bx + $bw - 10), ($by + $bh - 10), 10, 10, 0, 90); $bpath.AddArc($bx, ($by + $bh - 10), 10, 10, 90, 90)
+    $arc = [int](10 * $s)
+    $bpath.AddArc($bx, $by, $arc, $arc, 180, 90); $bpath.AddArc(($bx + $bw - $arc), $by, $arc, $arc, 270, 90)
+    $bpath.AddArc(($bx + $bw - $arc), ($by + $bh - $arc), $arc, $arc, 0, 90); $bpath.AddArc($bx, ($by + $bh - $arc), $arc, $arc, 90, 90)
     $bpath.CloseFigure()
     $g.FillPath($badgeCol, $bpath)
     $sf = New-Object System.Drawing.StringFormat
@@ -553,61 +719,96 @@ function Draw-Card($g) {
 
     # price
     if ($q) {
-        $g.DrawString(('{0:N2}' -f $q.Price), $script:FPrice, $dirBrush, $x0, 40)
-        $chgTxt = if ($q.Chg -ge 0) { ('+{0:N2}' -f $q.Chg) } else { ('{0:N2}' -f $q.Chg) }
-        $pctTxt = if ($q.Pct -ge 0) { ('+{0:N2}%' -f $q.Pct) } else { ('{0:N2}%' -f $q.Pct) }
+        # 启动时先显示的缓存(Stale)用灰字, 拿到实时数据再恢复涨跌色
+        $priceBrush = if ($q.Stale) { $script:BrDim } else { $dirBrush }
+        $priceTxt = Format-Price $q.Price
+        $g.DrawString($priceTxt, $script:FPrice, $priceBrush, $x0, [int](40 * $s))
+        $chgTxt = if ($q.Chg -ge 0) { '+' + (Format-Price $q.Chg) } else { (Format-Price $q.Chg) }
+        $pctTxt = if ($q.Pct -ge 0) { '+' + [string]::Format($script:InvCI, '{0:N2}%', $q.Pct) } else { [string]::Format($script:InvCI, '{0:N2}%', $q.Pct) }
         $arrow = if ($q.Up -gt 0) { '▲ ' } elseif ($q.Up -lt 0) { '▼ ' } else { '— ' }
-        $g.DrawString(("$arrow$chgTxt  $pctTxt"), $script:FPct, $dirBrush, 158, 47)
+        # 涨跌行按实测价格宽度定位: 价格位数变化/高 DPI 下都不会压到价格上
+        $pw = $g.MeasureString($priceTxt, $script:FPrice).Width
+        $px = $x0 + [int]$pw + [int](4 * $s)
+        $g.DrawString(("$arrow$chgTxt  $pctTxt"), $script:FPct, $priceBrush, $px, [int](47 * $s))
     } else {
-        $msg = if ($script:Fetching) { '获取行情中…' } elseif ($script:FetchErr) { '获取失败·网络不可达' } else { '等待数据…' }
-        $g.DrawString($msg, $script:FPrice, $script:BrDim, $x0, 42)
+        # 不再固定写"网络不可达": 代码不存在/网络超时是不同原因, 具体原因见下面的 err 行
+        $msg = if ($script:Fetching) { '获取行情中…' } elseif ($script:FetchErr) { '获取失败' } else { '等待数据…' }
+        $g.DrawString($msg, $script:FPrice, $script:BrDim, $x0, [int](42 * $s))
     }
 
     # detail lines
     $meta1 = ''; $meta2 = ''
+    $metaW = [float]($w - ($x0 * 2))
     if ($q) {
-        $o = if ($q.Open -gt 0) { ('{0:N2}' -f $q.Open) } else { '-' }
-        $p = if ($q.PrevClose -gt 0) { ('{0:N2}' -f $q.PrevClose) } else { '-' }
-        $hi = if ($q.High -gt 0) { ('{0:N2}' -f $q.High) } else { '-' }
-        $lo = if ($q.Low -gt 0) { ('{0:N2}' -f $q.Low) } else { '-' }
-        $meta1 = "昨收 $p  今开 $o  最高 $hi  最低 $lo"
+        $o = if ($q.Open -gt 0) { Format-PricePlain $q.Open } else { '-' }
+        $p = if ($q.PrevClose -gt 0) { Format-PricePlain $q.PrevClose } else { '-' }
+        $hi = if ($q.High -gt 0) { Format-PricePlain $q.High } else { '-' }
+        $lo = if ($q.Low -gt 0) { Format-PricePlain $q.Low } else { '-' }
+        $meta1 = "昨收 $p 今开 $o 最高 $hi 最低 $lo"
         $volTxt = if ($q.Volume -gt 0) { Format-Vol $q.Volume } else { '-' }
         $amtTxt = if ($q.Amount -gt 0) { Format-Amt $q.Amount ([string]$q.Currency) } else { '-' }
         $meta2 = "量 $volTxt   额 $amtTxt"
         if ($q.QuoteTime) { $meta2 += "   " + $q.QuoteTime }
     }
-    $g.DrawString($meta1, $script:FMeta, $script:BrDim, $x0, 96)
+    # 任意一行太长时按省略号截断, 不再溢出卡片
+    $sfM = New-Object System.Drawing.StringFormat
+    $sfM.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+    $sfM.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+    $g.DrawString($meta1, $script:FTiny, $script:BrDim,
+        (New-Object System.Drawing.RectangleF($x0, [int](97 * $s), $metaW, [float](16 * $s))), $sfM)
     if (-not $q -and $script:FetchErr) {
         $e = $script:FetchErr
-        if ($e.Length -gt 46) { $e = $e.Substring(0, 46) + '...' }
-        $g.DrawString($e, $script:FTiny, $script:BrDim, $x0, 118)
+        if ($e.Length -gt 40) { $e = $e.Substring(0, 40) + '...' }
+        $g.DrawString($e, $script:FTiny, $script:BrWarn,
+            (New-Object System.Drawing.RectangleF($x0, [int](118 * $s), $metaW, [float](16 * $s))), $sfM)
+    } elseif ($q -and $q.Warn) {
+        # 数据源给的异常提示(如北交所老代码)放在量额行, 不再和 footer 的重叠
+        $g.DrawString([string]$q.Warn, $script:FTiny, $script:BrWarn,
+            (New-Object System.Drawing.RectangleF($x0, [int](118 * $s), $metaW, [float](16 * $s))), $sfM)
     } else {
-        $g.DrawString($meta2, $script:FTiny, $script:BrDim, $x0, 118)
+        $g.DrawString($meta2, $script:FTiny, $script:BrDim,
+            (New-Object System.Drawing.RectangleF($x0, [int](118 * $s), $metaW, [float](16 * $s))), $sfM)
     }
+    $sfM.Dispose()
 
-    # footer
-    $foot = ''
-    if (-not $script:DemoOn) {
+    # footer: 先照顾异常/提醒, 其次才是数据源与时段
+    $foot = ''; $footBrush = $script:BrDim
+    if ($script:DemoOn) {
+        $foot = '演示模式'
+    } else {
         $ses = Get-TradingSession (Get-MarketKind $script:Ticker)
         $stTxt = $ses.Mkt + ' ' + $ses.Local.ToString('HH:mm') + '  ' + $ses.Label
-        if ($q) { $foot = "数据源 $($script:SourceUsed) · $stTxt" }
-        elseif ($script:Fetching) { $foot = "刷新中… · $stTxt" }
+        if ($q -and -not $script:Fetching -and $script:FetchErr) {
+            $foot = $script:FetchErr; $footBrush = $script:BrWarn
+        } elseif (-not $q -and $ses.Note) {
+            $foot = $ses.Note
+        } elseif ($q) {
+            $foot = "数据源 $($script:SourceUsed) · $stTxt"
+            if ($script:QuoteAt -ne [datetime]::MinValue) {
+                $age = [int]((Get-Date) - $script:QuoteAt).TotalSeconds
+                if ($age -ge 60) { $foot += ' · ' + [string]([int]($age / 60)) + ' 分钟前' }
+            }
+        } elseif ($script:Fetching) { $foot = "刷新中… · $stTxt" }
         else { $foot = $stTxt }
-    } else { $foot = '演示模式' }
+    }
     $sf2 = New-Object System.Drawing.StringFormat
     $sf2.Alignment = [System.Drawing.StringAlignment]::Far
-    $g.DrawString($foot, $script:FTiny, $script:BrDim,
-        (New-Object System.Drawing.RectangleF(16, 132, ($w - 32), 16)), $sf2)
+    $sf2.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+    $sf2.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+    $g.DrawString($foot, $script:FTiny, $footBrush,
+        (New-Object System.Drawing.RectangleF($x0, [int](132 * $s), $metaW, [float](16 * $s))), $sf2)
     $sf2.Dispose()
 
-    # toast
+    # toast: 不透明底, 否则会透出下面那行字
     if ($script:ToastText -and (Get-Date) -lt $script:ToastUntil) {
         $sz = $g.MeasureString($script:ToastText, $script:FTiny)
-        $tw = [math]::Ceiling($sz.Width) + 24; $th = [math]::Ceiling($sz.Height) + 10
-        $tx = [int](($w - $tw) / 2); $ty = $h - $th - 6
-        $tb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 8, 10, 14))
+        $tw = [int]([math]::Ceiling($sz.Width) + (24 * $s)); $th = [int]([math]::Ceiling($sz.Height) + (8 * $s))
+        $tx = [int](($w - $tw) / 2); if ($tx -lt 2) { $tx = 2 }
+        $ty = $h - $th - [int](4 * $s)
+        $tb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(250, 8, 10, 14))
         $g.FillRectangle($tb, $tx, $ty, $tw, $th)
-        $g.DrawString($script:ToastText, $script:FTiny, $script:BrText, ($tx + 12), ($ty + 4))
+        $g.DrawRectangle($script:PenCard, $tx, $ty, $tw, $th)
+        $g.DrawString($script:ToastText, $script:FTiny, $script:BrText, ($tx + [int](12 * $s)), ($ty + [int](4 * $s)))
         $tb.Dispose()
     }
 }
@@ -647,6 +848,7 @@ function On-Wheel($e) {
     $delta = if ($e.Delta -gt 0) { 0.05 } else { -0.05 }
     $script:Cfg.Opacity = [math]::Round([math]::Min(1.0, [math]::Max(0.2, [double]$script:Cfg.Opacity + $delta)), 2)
     $script:FadeTarget = [double]$script:Cfg.Opacity
+    if (-not $script:FadeRun -and $script:TmrFade) { $script:TmrFade.Start(); $script:FadeRun = $true }
     # 防抖: 滚动过程中不写盘, 停手约 0.7 秒后统一保存
     $script:CfgDirty = $true; $script:CfgDirtyAt = Get-Date
     Show-Toast ('透明度 {0}%' -f [int]($script:Cfg.Opacity * 100))
@@ -672,7 +874,8 @@ function Get-DemoQuote {
 }
 
 function Build-Form {
-    $W = 350; $H = 152; $R = 16
+    $s = $script:Scale
+    $W = [int](350 * $s); $H = [int](152 * $s); $R = [int](16 * $s)
     $cfg = $script:Cfg
 
     $form = New-Object System.Windows.Forms.Form
@@ -705,22 +908,12 @@ function Build-Form {
     }
     $form.Location = New-Object System.Drawing.Point($x, $y)
 
-    $script:FPrice = New-Object System.Drawing.Font('Segoe UI', 25, [System.Drawing.FontStyle]::Bold)
-    $script:FPct   = New-Object System.Drawing.Font('Segoe UI', 12.5, [System.Drawing.FontStyle]::Bold)
-    $script:FName  = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
-    $script:FMeta  = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-    $script:FTiny  = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
+    Initialize-Assets
+    $script:PaintRev++
 
-    $script:BrText   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 234, 238, 244))
-    $script:BrDim    = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 146, 154, 164))
-    $script:BrBadge  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 47, 174, 133))
-    $script:BrBadgeG = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 118, 128, 140))
-    $script:BrUp     = New-Object System.Drawing.SolidBrush($script:ColorUp)
-    $script:BrDown   = New-Object System.Drawing.SolidBrush($script:ColorDown)
-    $script:BrFlat   = New-Object System.Drawing.SolidBrush($script:ColorFlat)
-    $script:PenCard  = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 255, 255, 255), 1)
-
-    $form.add_Paint({ param($s, $e) try { Draw-Card $e.Graphics } catch { Trace-Msg ('PAINT ERR: ' + $_.Exception.Message) } })
+    $form.add_Paint({ param($s2, $e)
+        try { Draw-Card $e.Graphics $form.ClientSize.Width $form.ClientSize.Height }
+        catch { Trace-Msg ('PAINT ERR: ' + $_.Exception.Message) } })
     $form.add_MouseDown({ param($s, $e) On-MouseDown $e })
     $form.add_MouseMove({ param($s, $e) On-MouseMove $e })
     $form.add_MouseUp({ param($s, $e) On-MouseUp $e })
@@ -794,29 +987,42 @@ function Build-Form {
     } catch { Trace-Msg ('REFRESH ERR: ' + $_.Exception.Message) } })
     $tmrRefresh.Start()
 
+    $script:HoverRect = $null
     $tmrHover = New-Object System.Windows.Forms.Timer
-    $tmrHover.Interval = 250
+    $tmrHover.Interval = 400
     $tmrHover.add_Tick({
         try {
             if ($script:IsDragging -or $script:CtxOpen) { return }
             $p = [System.Windows.Forms.Cursor]::Position
-            $r = New-Object System.Drawing.Rectangle($form.Location, $form.Size)
-            $inside = $r.Contains($p)
-            if ($inside) { $script:FadeTarget = [double]$script:Cfg.Opacity }
-            elseif ($script:Cfg.AutoHide) { $script:FadeTarget = [double]$script:Cfg.HiddenOp }
-            else { $script:FadeTarget = [double]$script:Cfg.Opacity }
+            $rect = $script:HoverRect
+            if ($null -eq $rect -or $rect.X -ne $form.Location.X -or $rect.Y -ne $form.Location.Y -or
+                $rect.Width -ne $form.Width -or $rect.Height -ne $form.Height) {
+                $rect = New-Object System.Drawing.Rectangle($form.Location, $form.Size)
+                $script:HoverRect = $rect
+            }
+            $inside = $rect.Contains($p)
+            $tgt = [double]$script:Cfg.Opacity
+            if (-not $inside -and $script:Cfg.AutoHide) { $tgt = [double]$script:Cfg.HiddenOp }
+            if ([math]::Abs($tgt - $script:FadeTarget) -gt 0.004) {
+                $script:FadeTarget = $tgt
+                if (-not $script:FadeRun) { $script:TmrFade.Start(); $script:FadeRun = $true }
+            }
             # 配置防抖落盘 (滚轮调透明度/拖动位置后约 0.7 秒统一写入)
             if ($script:CfgDirty -and ((Get-Date) - $script:CfgDirtyAt).TotalMilliseconds -gt 700) {
                 $script:CfgDirty = $false
                 Save-Cfg
             }
-            $form.Invalidate()
+            # 只在内容版本变化(行情/错误/切换标的)时重画: 原先每 250ms 无条件全量重绘
+            if ($script:PaintRev -ne $script:SeenRev) {
+                $script:SeenRev = $script:PaintRev
+                $form.Invalidate()
+            }
         } catch { Trace-Msg ('HOVER ERR: ' + $_.Exception.Message) }
     })
     $tmrHover.Start()
 
     $tmrFade = New-Object System.Windows.Forms.Timer
-    $tmrFade.Interval = 18
+    $tmrFade.Interval = 16
     $tmrFade.add_Tick({
         try {
             $cur = $form.Opacity
@@ -824,29 +1030,42 @@ function Build-Form {
             if ([math]::Abs($diff) -gt 0.004) {
                 $step = 0.05 * [math]::Sign($diff)
                 $form.Opacity = [math]::Round([math]::Min(1.0, [math]::Max(0.02, ($cur + $step))), 3)
-            } elseif ([math]::Abs($cur - $script:FadeTarget) -gt 0.002) {
-                $form.Opacity = $script:FadeTarget
+            } else {
+                if ([math]::Abs($cur - $script:FadeTarget) -gt 0.001) { $form.Opacity = $script:FadeTarget }
+                # 动画收敛即停表: 空闲时不再每秒 60 次唤醒
+                $script:TmrFade.Stop()
+                $script:FadeRun = $false
             }
-            if ((Get-Date) -gt $script:ToastUntil) {
-                if ($script:ToastText) { $script:ToastText = ''; $form.Invalidate() }
+            if ((Get-Date) -gt $script:ToastUntil -and $script:ToastText) {
+                $script:ToastText = ''
+                $script:PaintRev++
             }
         } catch { Trace-Msg ('FADE ERR: ' + $_.Exception.Message) }
     })
-    $tmrFade.Start()
 
     $tmrPoll = New-Object System.Windows.Forms.Timer
-    $tmrPoll.Interval = 400
+    $tmrPoll.Interval = 300
     $tmrPoll.add_Tick({
         try {
-            if (-not $script:Fetching) { return }
+            if (-not $script:Fetching) { $script:TmrPoll.Stop(); return }
+            # 一次性子进程兜底模式: 等进程退出
             $proc = $script:FetchProc
-            if ($proc -and -not $proc.HasExited) {
-                if (((Get-Date) - $script:FetchStart).TotalMilliseconds -gt $script:FetchTimeoutMs) {
-                    try { $proc.Kill() } catch {}
-                } else { return }
+            if ($proc -and -not $proc.HasExited -and
+                ((Get-Date) - $script:FetchStart).TotalMilliseconds -lt $script:FetchTimeoutMs) { return }
+            if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
+            $done = Try-Complete-Fetch
+            if (-not $done -and ((Get-Date) - $script:FetchStart).TotalMilliseconds -gt $script:FetchTimeoutMs) {
+                # 常驻进程卡死: 杀掉重建, 免得后续每轮都卡
+                $script:FetchErr = '取数超时'
+                $script:PaintRev++
+                Stop-FetchHost
+                $done = $true
             }
-            Complete-Fetch
-            if ($script:FetchProc) { try { $script:FetchProc.Dispose() } catch {}; $script:FetchProc = $null }
+            if ($done) {
+                $script:Fetching = $false
+                $script:TmrPoll.Stop()
+                if ($script:FetchProc) { try { $script:FetchProc.Dispose() } catch {}; $script:FetchProc = $null }
+            }
         } catch { Trace-Msg ('POLL ERR: ' + $_.Exception.Message) }
     })
 
@@ -854,8 +1073,11 @@ function Build-Form {
     $form.add_FormClosed({
         try {
             Trace-Msg 'form closed'
+            Stop-FetchHost
             if ($script:FetchProc) {
                 try { if (-not $script:FetchProc.HasExited) { $script:FetchProc.Kill() } } catch {}
+                try { $script:FetchProc.Dispose() } catch {}
+                $script:FetchProc = $null
             }
             $script:Cfg.X = $form.Location.X
             $script:Cfg.Y = $form.Location.Y
@@ -1014,8 +1236,10 @@ function Show-SettingsDialog {
         $form.TopMost = [bool]$cfg.TopMost
         if ($script:TmrRefresh) { $script:TmrRefresh.Interval = (Get-EffectiveRefreshSec) * 1000 }
         $script:FadeTarget = [double]$cfg.Opacity
+        if (-not $script:FadeRun -and $script:TmrFade) { $script:TmrFade.Start(); $script:FadeRun = $true }
         Update-ThemeColors
         Save-Cfg
+        $script:PaintRev++
         if ($script:DemoOn) { $script:Quote = Get-DemoQuote } else { Start-Fetch }
         $form.Invalidate()
         $dlg.Close()
@@ -1052,21 +1276,25 @@ function Main {
         Update-ThemeColors
         # 清理上次异常退出遗留的取数临时文件
         try { Get-ChildItem (Join-Path $script:ConfigDir 'fetch-*.json') -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
-        # 迁移: 早期版本默认把东财排在首位(本机常不可达), 改为腾讯优先
+        # 迁移: 早期版本默认把东财排在首位(本机常不可达), 改为腾讯优先。
+        # 只迁移一次, 之后尊重用户在 config.json 里的源顺序。
         try {
-            $sc = @($script:Cfg.Sources)
-            if ($sc.Count -gt 0 -and $sc[0] -eq 'eastmoney') {
-                $script:Cfg.Sources = @('tencent') + @($sc | Where-Object { $_ -ne 'tencent' })
+            if (-not $script:Cfg.SrcMigrated) {
+                $sc = @($script:Cfg.Sources)
+                if ($sc.Count -gt 0 -and $sc[0] -eq 'eastmoney') {
+                    $script:Cfg.Sources = @('tencent') + @($sc | Where-Object { $_ -ne 'tencent' })
+                }
+                $script:Cfg.SrcMigrated = $true
                 Save-Cfg
             }
         } catch {}
-        # 启动诊断: 记录当前市场/时段/下一个节假日
+        # 启动诊断: 记录当前市场/时段/下一个节假日/DPI
         try {
             $mk = Get-MarketKind $script:Ticker
             $ses = Get-TradingSession $mk
             $nh = Get-NextMarketHoliday $mk
             $exeInfo = if ($env:PDDWIDGET_EXE) { [string]$env:PDDWIDGET_EXE } else { 'script' }
-            Trace-Msg ('startup: ticker=' + $script:Ticker + ' market=' + $mk + ' session=' + $ses.Key + ' nextHoliday=' + $nh + ' launchedBy=' + $exeInfo)
+            Trace-Msg ('startup: ticker=' + $script:Ticker + ' market=' + $mk + ' session=' + $ses.Key + ' nextHoliday=' + $nh + ' scale=' + $script:Scale + ' launchedBy=' + $exeInfo)
         } catch {}
 
         $owns = $false
@@ -1104,4 +1332,4 @@ function Main {
     }
 }
 
-Main
+if (-not $NoRun) { Main }
