@@ -1,4 +1,4 @@
-﻿# 本地配置与日志
+# 本地配置与日志
 config/
 *.log
 
@@ -6,6 +6,10 @@ config/
 _dsh_probe.txt
 fetch-*.json
 ~$*
+*.tmp
+
+# 分发产物：需要发布时用 Release 上传，不要直接入库二进制
+dist/*.exe
 
 # 系统文件
 Thumbs.db
